@@ -23,6 +23,7 @@ import numpy as np
 import concurrent.futures
 from tqdm import tqdm
 import pandas_market_calendars as mcal
+import time
 
 import sys
 project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), '../..'))
@@ -159,8 +160,8 @@ class FMPFetcher(BaseDataFetcher, DataSource):
 
     def __init__(self, cache_dir: str = "./data/cache"):
         super().__init__(cache_dir)
-        # self.base_url = "https://financialmodelingprep.com/api/v3"
-        self.base_url = "https://financialmodelingprep.com/stable/"
+        self.base_url = "https://financialmodelingprep.com/api/v3/"
+        # self.base_url = "https://financialmodelingprep.com/stable/"
         # Offline mode when API key is not provided; computed lazily but default here
         self.api_key = self._get_api_key()
         self.offline_mode = not bool(self.api_key)
@@ -225,10 +226,10 @@ class FMPFetcher(BaseDataFetcher, DataSource):
 
     def _fetch_fmp_data(self, ticker: str, endpoint: str, period: str,
                         start_date: Optional[str] = None, end_date: Optional[str] = None) -> List[Dict[str, Any]]:
-        """Helper to fetch data from FMP API with local-first strategy.
+        """Helper to fetch data from FMP API with local-first strategy and retry mechanism.
 
         - If start/end provided and raw payload in DB is sufficiently fresh, return it.
-        - Else call API, then save raw payload and cache.
+        - Else call API with retry logic, then save raw payload and cache.
         """
 
         # Map endpoint -> payload key for raw save/load
@@ -273,20 +274,30 @@ class FMPFetcher(BaseDataFetcher, DataSource):
         else:
             url = f"{self.base_url}/{endpoint}/{ticker}?period={period}&apikey={self.api_key}"
 
-        try:
-            response = requests.get(url)
-            response.raise_for_status()
-            data = response.json()
-            # Save raw payload for fundamentals endpoints
-            if payload_key and start_date and end_date:
-                try:
-                    self.data_store._save_raw_payload('FMP', ticker, payload_key, start_date, end_date, data)
-                except Exception as se:
-                    logger.debug(f"Failed to save raw FMP payload {payload_key} for {ticker}: {se}")
-            return data
-        except requests.exceptions.RequestException as e:
-            logger.warning(f"Failed to fetch {endpoint} data for {ticker}: {e}")
-            return []
+        # Retry logic for API calls
+        max_retries = 3
+        retry_delay = 2  # Initial delay in seconds
+        for attempt in range(max_retries):
+            try:
+                response = requests.get(url, timeout=30)
+                response.raise_for_status()
+                data = response.json()
+                # Save raw payload for fundamentals endpoints
+                if payload_key and start_date and end_date:
+                    try:
+                        self.data_store._save_raw_payload('FMP', ticker, payload_key, start_date, end_date, data)
+                    except Exception as se:
+                        logger.debug(f"Failed to save raw FMP payload {payload_key} for {ticker}: {se}")
+                return data
+            except (requests.exceptions.SSLError, requests.exceptions.ConnectionError,
+                    requests.exceptions.Timeout, requests.exceptions.RequestException) as e:
+                if attempt < max_retries - 1:  # Not the last attempt
+                    logger.warning(f"Failed to fetch {endpoint} data for {ticker} (attempt {attempt + 1}/{max_retries}): {e}. Retrying in {retry_delay}s...")
+                    time.sleep(retry_delay)
+                    retry_delay *= 2  # Exponential backoff
+                else:
+                    logger.warning(f"Failed to fetch {endpoint} data for {ticker} after {max_retries} attempts: {e}")
+                    return []
 
     def get_sp500_components(self, date: str = None) -> pd.DataFrame:
         """Get S&P 500 components from FMP."""
@@ -295,7 +306,7 @@ class FMPFetcher(BaseDataFetcher, DataSource):
         
         # Check database first
         cached_tickers, cached_sectors, cached_dateFirstAdded = self.data_store.get_sp500_components(date)
-        if cached_tickers:
+        if cached_tickers and cached_sectors and cached_dateFirstAdded:
             logger.info(f"Loading S&P 500 components from database for {date}")
             return pd.DataFrame({'tickers': cached_tickers.split(","), 'sectors': cached_sectors.split(","), 'dateFirstAdded': cached_dateFirstAdded.split(",")})
 
@@ -312,7 +323,7 @@ class FMPFetcher(BaseDataFetcher, DataSource):
             if not self.api_key:
                 raise ValueError("FMP API key not found")
 
-            url = f"{self.base_url}/sp500-constituent?apikey={self.api_key}"
+            url = f"{self.base_url}/sp500_constituent?apikey={self.api_key}"
             response = requests.get(url)
             response.raise_for_status()
 
@@ -552,6 +563,11 @@ class FMPFetcher(BaseDataFetcher, DataSource):
         # Step 2: Decide tickers to handle (local-first inside _fetch_fmp_data avoids extra API calls)
         tickers_to_fetch = list(tickers['tickers'])
 
+        # Initialize variables with default values
+        extended_start_date = start_date
+        extended_end_date = end_date
+        align_to_mjsd_first = None
+
         # Step 3: Fetch missing data from API
         all_records: List[Dict[str, Any]] = []
         if tickers_to_fetch:
@@ -565,7 +581,7 @@ class FMPFetcher(BaseDataFetcher, DataSource):
             extended_end_dt = min(candidate_end_dt, today)
             extended_start_date = extended_start_dt.strftime('%Y-%m-%d')
             extended_end_date = extended_end_dt.strftime('%Y-%m-%d')
-            
+
             def align_to_mjsd_first(d: pd.Timestamp) -> pd.Timestamp:
                 # Map quarter end month to the 1st day of the following 2 months later: target months 3,6,9,12 => day 1
                 # We approximate by finding the quarter index and composing a date with month in {3,6,9,12} and day=1
@@ -736,14 +752,20 @@ class FMPFetcher(BaseDataFetcher, DataSource):
                     # EPS, BPS, DPS
                     eps = income_q.get('eps')
                     net_income = income_q.get('netIncome')
-                    if eps is None and shares_out:
-                        eps = net_income / shares_out if shares_out else np.nan
+                    try:
+                        net_income = float(net_income) if net_income is not None else None
+                    except Exception:
+                        net_income = None
 
-                    bps = (equity / shares_out) if shares_out else np.nan
+                    if eps is None and net_income is not None and shares_out:
+                        eps = net_income / shares_out
+
+                    bps = (equity / shares_out) if shares_out and equity != 0 else np.nan
 
                     dividends_paid = cash_q.get('dividendsPaid')
                     try:
-                        dps = (abs(float(dividends_paid)) / shares_out) if (dividends_paid is not None and shares_out) else np.nan
+                        dividends_paid_val = float(dividends_paid) if dividends_paid is not None else None
+                        dps = (abs(dividends_paid_val) / shares_out) if (dividends_paid_val is not None and shares_out) else np.nan
                     except Exception:
                         dps = np.nan
 
@@ -811,7 +833,7 @@ class FMPFetcher(BaseDataFetcher, DataSource):
                         except Exception:
                             pb = np.nan
 
-                    roe = (net_income / equity) if equity not in (0, np.nan) else np.nan
+                    roe = (net_income / equity) if (net_income is not None and equity not in (0, np.nan) and equity != 0) else np.nan
 
                     record = {
                         'gvkey': ticker,
@@ -986,35 +1008,59 @@ class FMPFetcher(BaseDataFetcher, DataSource):
                     min_date = min(start for start, _ in date_ranges)
                     max_date = max(end for _, end in date_ranges)
 
-                    url = f"{self.base_url}/historical-price-eod/full?symbol={ticker}?from={min_date}&to={max_date}&apikey={self.api_key}"
-                    response = requests.get(url)
-                    response.raise_for_status()
-                    
-                    data = response.json()
+                    url = f"{self.base_url}/historical-price-full/{ticker}?from={min_date}&to={max_date}&apikey={self.api_key}"
+
+                    # Retry logic for API calls
+                    max_retries = 3
+                    retry_delay = 2  # Initial delay in seconds
+                    data = None
+                    for attempt in range(max_retries):
+                        try:
+                            response = requests.get(url, timeout=30)
+                            response.raise_for_status()
+                            data = response.json()
+                            break  # Success, exit retry loop
+                        except (requests.exceptions.SSLError, requests.exceptions.ConnectionError,
+                                requests.exceptions.Timeout, requests.exceptions.RequestException) as e:
+                            if attempt < max_retries - 1:  # Not the last attempt
+                                logger.warning(f"Failed to fetch price data for {ticker} (attempt {attempt + 1}/{max_retries}): {e}. Retrying in {retry_delay}s...")
+                                time.sleep(retry_delay)
+                                retry_delay *= 2  # Exponential backoff
+                            else:
+                                logger.warning(f"Failed to fetch price data for {ticker} after {max_retries} attempts: {e}")
+                                data = None
+
+                    if data is None:
+                        continue  # Skip this ticker if all retries failed
                     
                     if 'historical' in data:
-                        ticker_data = []
-                        for item in data['historical']:
-                            record = {
-                                'gvkey': ticker,
-                                'datadate': item['date'],
-                                'tic': ticker,
-                                'prccd': item['close'],
-                                'prcod': item['open'],
-                                'prchd': item['high'],
-                                'prcld': item['low'],
-                                'cshtrd': item['volume'],
-                                'adj_close': item.get('adjClose', item['close'])
-                            }
-                            ticker_data.append(record)
-                        
-                        if ticker_data:
-                            all_data.extend(ticker_data)
-                            logger.debug(f"Fetched {len(ticker_data)} records for {ticker} ({min_date} to {max_date})")
+                        historical_data = data['historical']
+                        if isinstance(historical_data, list) and historical_data:
+                            ticker_data = []
+                            for item in historical_data:
+                                record = {
+                                    'gvkey': ticker,
+                                    'datadate': item['date'],
+                                    'tic': ticker,
+                                    'prccd': item['close'],
+                                    'prcod': item['open'],
+                                    'prchd': item['high'],
+                                    'prcld': item['low'],
+                                    'cshtrd': item['volume'],
+                                    'adj_close': item.get('adjClose', item['close'])
+                                }
+                                ticker_data.append(record)
+
+                            if ticker_data:
+                                all_data.extend(ticker_data)
+                                logger.debug(f"Fetched {len(ticker_data)} records for {ticker} ({min_date} to {max_date})")
+                            else:
+                                logger.warning(f"No historical data for {ticker} ({min_date} to {max_date})")
                         else:
-                            logger.warning(f"No historical data for {ticker} ({min_date} to {max_date})")
+                            logger.warning(f"Historical data is empty or not a list for {ticker} ({min_date} to {max_date})")
                     else:
                         logger.warning(f"No historical data key in response for {ticker} ({min_date} to {max_date})")
+                        logger.debug(f"Response keys: {list(data.keys()) if isinstance(data, dict) else type(data)}")
 
                 except Exception as e:
                     logger.warning(f"Failed to fetch price data for {ticker} ({min_date} to {max_date}): {e}")

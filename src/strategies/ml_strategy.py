@@ -554,8 +554,10 @@ class MLStockSelectionStrategy(BaseStrategy):
         y = df['y_return'].astype(float)
         dates = df['datadate']
 
-        # Align by dropping rows with NaN in X only (ignore y_return nan check)
-        valid_mask = ~X.isna().any(axis=1)
+        # Align by dropping rows with NaN in X or y
+        x_valid_mask = ~X.isna().any(axis=1)
+        y_valid_mask = ~y.isna()
+        valid_mask = x_valid_mask & y_valid_mask
 
         X = X.loc[valid_mask]
         y = y.loc[valid_mask]
@@ -578,11 +580,15 @@ class MLStockSelectionStrategy(BaseStrategy):
         """
         X, y, dates = self._prepare_supervised_dataset(fundamentals)
 
-        # Add helper index
+        # Add helper index - ensure continuous index
         df_xy = pd.DataFrame({'datadate': dates.values})
         df_xy = df_xy.join(X.reset_index(drop=True))
         df_xy['y_return'] = y.values
         df_xy['row_idx'] = np.arange(len(df_xy))
+        # Add gvkey from fundamentals for prediction results
+        df_xy['gvkey'] = fundamentals.loc[X.index, 'gvkey'].values
+        # Reset index to ensure continuous indexing
+        df_xy = df_xy.reset_index(drop=True)
 
         # Unique quarterly dates (sorted)
         unique_dates = sorted(pd.to_datetime(fundamentals['datadate'].dropna().unique()))
@@ -590,7 +596,21 @@ class MLStockSelectionStrategy(BaseStrategy):
             raise ValueError("无可用季度日期")
 
         # 使用传入数据中的最后一个日期作为 trade_date
-        trade_date = unique_dates[-1]
+        # 但要确保不超过当前日期（避免预测未来）
+        from datetime import datetime
+        current_date = pd.Timestamp(datetime.now().date())
+
+        # 找到最后一个不超过当前日期的季度
+        trade_date = None
+        for date in reversed(unique_dates):
+            if pd.to_datetime(date) <= current_date:
+                trade_date = date
+                break
+
+        # 如果没有合适的日期，使用最新的可用日期
+        if trade_date is None:
+            trade_date = unique_dates[-1]
+            logger.warning(f"所有季度日期都在未来，使用最新日期 {trade_date} 进行预测")
 
         i = unique_dates.index(trade_date)
         # 需要至少 test_quarters 个验证窗口，且训练窗口至少包含一个季度
@@ -603,11 +623,11 @@ class MLStockSelectionStrategy(BaseStrategy):
         test_start = unique_dates[i - test_quarters]
         test_end_exclusive = unique_dates[i]
 
-        # Build boolean masks on df_xy by date
+        # Build boolean masks on df_xy by date (ensure alignment with df_xy index)
         masks_date = pd.to_datetime(df_xy['datadate'])
-        train_mask = (masks_date >= train_start) & (masks_date < train_end_exclusive)
-        test_mask = (masks_date >= test_start) & (masks_date < test_end_exclusive)
-        trade_mask = (masks_date == trade_date)
+        train_mask = ((masks_date >= train_start) & (masks_date < train_end_exclusive)).values
+        test_mask = ((masks_date >= test_start) & (masks_date < test_end_exclusive)).values
+        trade_mask = (masks_date == trade_date).values
 
         # 去掉"Unnamed: 0"这类列
         feature_cols = [col for col in X.columns if not col.startswith('Unnamed:')]
@@ -618,9 +638,24 @@ class MLStockSelectionStrategy(BaseStrategy):
         y_test = df_xy.loc[test_mask, 'y_return']
 
         X_trade = df_xy.loc[trade_mask, feature_cols]
-        # Align gvkey with the same valid rows used for X/y to avoid mismatch
-        gvkey_series_all = fundamentals.loc[X.index, 'gvkey'].reset_index(drop=True)
-        gvkey_trade = gvkey_series_all.loc[trade_mask].reset_index(drop=True)
+        # Get gvkey directly from the aligned df_xy data
+        gvkey_trade = df_xy.loc[trade_mask, 'gvkey']
+
+        # Additional filtering: remove any remaining NaN values in training data
+        if len(X_train) > 0:
+            train_valid = ~(X_train.isna().any(axis=1) | y_train.isna())
+            X_train = X_train[train_valid]
+            y_train = y_train[train_valid]
+
+        if len(X_test) > 0:
+            test_valid = ~(X_test.isna().any(axis=1) | y_test.isna())
+            X_test = X_test[test_valid]
+            y_test = y_test[test_valid]
+
+        if len(X_trade) > 0:
+            trade_valid = ~X_trade.isna().any(axis=1)
+            X_trade = X_trade[trade_valid]
+            gvkey_trade = gvkey_trade[trade_valid]
 
         if len(X_train) < 10 or len(X_trade) == 0:
             raise ValueError("训练或交易样本不足")
@@ -849,13 +884,17 @@ class MLStockSelectionStrategy(BaseStrategy):
                 sel = g[(g['predicted_return'] >= thr) & (g['predicted_return'] > 0)][['gvkey', 'predicted_return']].copy()
                 if len(sel) == 0:
                     continue
-                
-                # 使用新的权重分配函数（优先使用基本面数据中的价格）
+
+                # 修复数据泄露问题：只使用该日期之前的历史数据计算权重
+                historical_fundamentals = fundamentals[fundamentals['datadate'] <= dt].copy() if fundamentals is not None else None
+                historical_price_data = price_data[price_data['date'] <= dt].copy() if price_data is not None else None
+
+                # 使用新的权重分配函数（使用历史数据避免未来数据泄露）
                 sel = self.allocate_weights(
                     selected_stocks=sel,
                     method=weight_method,
-                    fundamentals=fundamentals,
-                    price_data=price_data,
+                    fundamentals=historical_fundamentals,
+                    price_data=historical_price_data,
                     **kwargs
                 )
                 sel['date'] = dt
@@ -1077,13 +1116,17 @@ class SectorNeutralMLStrategy(MLStockSelectionStrategy):
                 if g.empty:
                     continue
                 g = g[['gvkey', 'predicted_return', 'sector']].copy()
-                
-                # 使用新的权重分配函数（优先使用基本面数据中的价格）
+
+                # 修复数据泄露问题：只使用该日期之前的历史数据计算权重
+                historical_fundamentals = fundamentals[fundamentals['datadate'] <= dt].copy() if fundamentals is not None else None
+                historical_price_data = price_data[price_data['date'] <= dt].copy() if price_data is not None else None
+
+                # 使用新的权重分配函数（使用历史数据避免未来数据泄露）
                 g = self.allocate_weights(
                     selected_stocks=g,
                     method=weight_method,
-                    fundamentals=fundamentals,
-                    price_data=price_data,
+                    fundamentals=historical_fundamentals,
+                    price_data=historical_price_data,
                     **kwargs
                 )
                 g['date'] = dt
