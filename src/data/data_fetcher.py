@@ -206,6 +206,45 @@ class FMPFetcher(BaseDataFetcher, DataSource):
             self._openai_api_key = None
             self._sentiment_model = None
 
+    def _make_request_with_retry(self, url: str, params: Optional[Dict[str, Any]] = None,
+                                 timeout: int = 30, max_retries: int = 3, retry_delay: int = 2) -> requests.Response:
+        """
+        Make HTTP request with retry mechanism and exponential backoff.
+
+        Args:
+            url: URL to request
+            params: Query parameters (alternative to embedding in URL)
+            timeout: Request timeout in seconds
+            max_retries: Maximum number of retry attempts
+            retry_delay: Initial delay between retries in seconds
+
+        Returns:
+            Response object
+
+        Raises:
+            Last exception after all retries exhausted
+        """
+        last_exception = None
+        current_delay = retry_delay
+
+        for attempt in range(max_retries):
+            try:
+                response = requests.get(url, params=params, timeout=timeout)
+                response.raise_for_status()
+                return response
+            except (requests.exceptions.SSLError, requests.exceptions.ConnectionError,
+                    requests.exceptions.Timeout, requests.exceptions.RequestException) as e:
+                last_exception = e
+                if attempt < max_retries - 1:  # Not the last attempt
+                    logger.warning(f"Request failed (attempt {attempt + 1}/{max_retries}): {e}. Retrying in {current_delay}s...")
+                    time.sleep(current_delay)
+                    current_delay *= 2  # Exponential backoff
+                else:
+                    logger.warning(f"Request failed after {max_retries} attempts: {e}")
+
+        # If we get here, all retries failed
+        raise last_exception
+
     def _get_openai_client(self):
         """Lazily initialize OpenAI client."""
         if not self._openai_api_key:
@@ -274,30 +313,20 @@ class FMPFetcher(BaseDataFetcher, DataSource):
         else:
             url = f"{self.base_url}/{endpoint}/{ticker}?period={period}&apikey={self.api_key}"
 
-        # Retry logic for API calls
-        max_retries = 3
-        retry_delay = 2  # Initial delay in seconds
-        for attempt in range(max_retries):
-            try:
-                response = requests.get(url, timeout=30)
-                response.raise_for_status()
-                data = response.json()
-                # Save raw payload for fundamentals endpoints
-                if payload_key and start_date and end_date:
-                    try:
-                        self.data_store._save_raw_payload('FMP', ticker, payload_key, start_date, end_date, data)
-                    except Exception as se:
-                        logger.debug(f"Failed to save raw FMP payload {payload_key} for {ticker}: {se}")
-                return data
-            except (requests.exceptions.SSLError, requests.exceptions.ConnectionError,
-                    requests.exceptions.Timeout, requests.exceptions.RequestException) as e:
-                if attempt < max_retries - 1:  # Not the last attempt
-                    logger.warning(f"Failed to fetch {endpoint} data for {ticker} (attempt {attempt + 1}/{max_retries}): {e}. Retrying in {retry_delay}s...")
-                    time.sleep(retry_delay)
-                    retry_delay *= 2  # Exponential backoff
-                else:
-                    logger.warning(f"Failed to fetch {endpoint} data for {ticker} after {max_retries} attempts: {e}")
-                    return []
+        try:
+            response = self._make_request_with_retry(url, timeout=30)
+            data = response.json()
+            # Save raw payload for fundamentals endpoints
+            if payload_key and start_date and end_date:
+                try:
+                    self.data_store._save_raw_payload('FMP', ticker, payload_key, start_date, end_date, data)
+                except Exception as se:
+                    logger.debug(f"Failed to save raw FMP payload {payload_key} for {ticker}: {se}")
+            return data
+        except (requests.exceptions.SSLError, requests.exceptions.ConnectionError,
+                requests.exceptions.Timeout, requests.exceptions.RequestException) as e:
+            logger.warning(f"Failed to fetch {endpoint} data for {ticker}: {e}")
+            return []
 
     def get_sp500_components(self, date: str = None) -> pd.DataFrame:
         """Get S&P 500 components from FMP."""
@@ -324,8 +353,7 @@ class FMPFetcher(BaseDataFetcher, DataSource):
                 raise ValueError("FMP API key not found")
 
             url = f"{self.base_url}/sp500_constituent?apikey={self.api_key}"
-            response = requests.get(url)
-            response.raise_for_status()
+            response = self._make_request_with_retry(url)
 
             data = response.json()
 
@@ -512,8 +540,7 @@ class FMPFetcher(BaseDataFetcher, DataSource):
                     f"symbols={ticker}&from={range_start}&to={range_end}&apikey={self.api_key}"
                 )
                 try:
-                    response = requests.get(url, timeout=30)
-                    response.raise_for_status()
+                    response = self._make_request_with_retry(url, timeout=30)
                     payload = response.json()
                     if isinstance(payload, dict) and 'news' in payload:
                         news_items = payload['news']
@@ -899,8 +926,7 @@ class FMPFetcher(BaseDataFetcher, DataSource):
         if not self.api_key:
             raise ValueError("FMP API key not found")
         url = f"{self.base_url}/actively-trading-list?apikey={self.api_key}"
-        response = requests.get(url)
-        response.raise_for_status()
+        response = self._make_request_with_retry(url)
         data = response.json()
         return data
 
@@ -909,8 +935,7 @@ class FMPFetcher(BaseDataFetcher, DataSource):
         if not self.api_key:
             raise ValueError("FMP API key not found")
         url = f"{self.base_url}/quote?symbol={ticker}&apikey={self.api_key}"
-        response = requests.get(url)
-        response.raise_for_status()
+        response = self._make_request_with_retry(url)
         data = response.json()
         return data
 
@@ -919,8 +944,7 @@ class FMPFetcher(BaseDataFetcher, DataSource):
         if not self.api_key:
             raise ValueError("FMP API key not found")
         url = f"{self.base_url}/batch-quote?symbols={','.join(tickers)}&apikey={self.api_key}"
-        response = requests.get(url)
-        response.raise_for_status()
+        response = self._make_request_with_retry(url)
         data = response.json()
         return data
 
@@ -1010,25 +1034,13 @@ class FMPFetcher(BaseDataFetcher, DataSource):
 
                     url = f"{self.base_url}/historical-price-full/{ticker}?from={min_date}&to={max_date}&apikey={self.api_key}"
 
-                    # Retry logic for API calls
-                    max_retries = 3
-                    retry_delay = 2  # Initial delay in seconds
-                    data = None
-                    for attempt in range(max_retries):
-                        try:
-                            response = requests.get(url, timeout=30)
-                            response.raise_for_status()
-                            data = response.json()
-                            break  # Success, exit retry loop
-                        except (requests.exceptions.SSLError, requests.exceptions.ConnectionError,
-                                requests.exceptions.Timeout, requests.exceptions.RequestException) as e:
-                            if attempt < max_retries - 1:  # Not the last attempt
-                                logger.warning(f"Failed to fetch price data for {ticker} (attempt {attempt + 1}/{max_retries}): {e}. Retrying in {retry_delay}s...")
-                                time.sleep(retry_delay)
-                                retry_delay *= 2  # Exponential backoff
-                            else:
-                                logger.warning(f"Failed to fetch price data for {ticker} after {max_retries} attempts: {e}")
-                                data = None
+                    try:
+                        response = self._make_request_with_retry(url, timeout=30)
+                        data = response.json()
+                    except (requests.exceptions.SSLError, requests.exceptions.ConnectionError,
+                            requests.exceptions.Timeout, requests.exceptions.RequestException) as e:
+                        logger.warning(f"Failed to fetch price data for {ticker}: {e}")
+                        data = None
 
                     if data is None:
                         continue  # Skip this ticker if all retries failed
@@ -1360,3 +1372,5 @@ if __name__ == "__main__":
         preview_cols = ['published_date', 'publisher', 'title', 'sentiment']
         available_cols = [col for col in preview_cols if col in news_df.columns]
         print(news_df[available_cols].head())
+        end_date="2025-01-03",
+        start_date="2025-01-01",
