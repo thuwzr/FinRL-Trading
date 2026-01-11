@@ -886,8 +886,20 @@ class MLStockSelectionStrategy(BaseStrategy):
                     continue
 
                 # 修复数据泄露问题：只使用该日期之前的历史数据计算权重
-                historical_fundamentals = fundamentals[fundamentals['datadate'] <= dt].copy() if fundamentals is not None else None
-                historical_price_data = price_data[price_data['date'] <= dt].copy() if price_data is not None else None
+                # 确保日期列是datetime类型以进行比较
+                if fundamentals is not None and 'datadate' in fundamentals.columns:
+                    fundamentals_copy = fundamentals.copy()
+                    fundamentals_copy['datadate'] = pd.to_datetime(fundamentals_copy['datadate'], errors='coerce')
+                    historical_fundamentals = fundamentals_copy[fundamentals_copy['datadate'] <= dt].copy()
+                else:
+                    historical_fundamentals = None
+
+                if price_data is not None and 'date' in price_data.columns:
+                    price_data_copy = price_data.copy()
+                    price_data_copy['date'] = pd.to_datetime(price_data_copy['date'], errors='coerce')
+                    historical_price_data = price_data_copy[price_data_copy['date'] <= dt].copy()
+                else:
+                    historical_price_data = None
 
                 # 使用新的权重分配函数（使用历史数据避免未来数据泄露）
                 sel = self.allocate_weights(
@@ -1118,8 +1130,20 @@ class SectorNeutralMLStrategy(MLStockSelectionStrategy):
                 g = g[['gvkey', 'predicted_return', 'sector']].copy()
 
                 # 修复数据泄露问题：只使用该日期之前的历史数据计算权重
-                historical_fundamentals = fundamentals[fundamentals['datadate'] <= dt].copy() if fundamentals is not None else None
-                historical_price_data = price_data[price_data['date'] <= dt].copy() if price_data is not None else None
+                # 确保日期列是datetime类型以进行比较
+                if fundamentals is not None and 'datadate' in fundamentals.columns:
+                    fundamentals_copy = fundamentals.copy()
+                    fundamentals_copy['datadate'] = pd.to_datetime(fundamentals_copy['datadate'])
+                    historical_fundamentals = fundamentals_copy[fundamentals_copy['datadate'] <= dt].copy()
+                else:
+                    historical_fundamentals = None
+
+                if price_data is not None and 'date' in price_data.columns:
+                    price_data_copy = price_data.copy()
+                    price_data_copy['date'] = pd.to_datetime(price_data_copy['date'])
+                    historical_price_data = price_data_copy[price_data_copy['date'] <= dt].copy()
+                else:
+                    historical_price_data = None
 
                 # 使用新的权重分配函数（使用历史数据避免未来数据泄露）
                 g = self.allocate_weights(
